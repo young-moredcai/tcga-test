@@ -1,0 +1,655 @@
+---
+title: "Screen method"
+format: html
+editor: visual
+---
+
+# Using screen methods to select miRNA \~ LVI
+
+```{r}
+######################################
+library(MASS)
+library(splines)
+library(glmnet)
+library(Matrix)
+library(mvtnorm)
+library(survival)
+library(glasso)
+library(network)
+library(ncvreg)
+library(Hmisc)
+library(huge)
+library(corrplot)
+library(GEInter)
+library(SIS)
+########################################
+```
+
+## Set up the data
+
+```{r}
+
+TCGA<- read.table("new_data.txt", header = TRUE)
+
+library(survival)
+
+ #Create a survival object with time and event variables
+my.survival <- Surv(TCGA$OS.time, TCGA$OS)
+
+#Fit the Kaplan-Meier survival curve
+my.km <- survfit(my.survival ~ 1)
+
+# Plot the survival curve
+plot(my.km)
+
+##checking data
+dim(TCGA) ## 326 row, 260-3 number of genes
+
+length(TCGA[,3])
+
+##Transferring unit, from day to months
+TCGA[,3]=TCGA[,3]/30+runif(dim(TCGA)[1],1e-05,1e-03) #months
+
+##creating the plot for survival time (months) of each subject
+par(mfcol=c(1,2))
+subject=c(1:dim(TCGA)[1])
+plot(subject,TCGA[,3],xlab="subject",ylab="survival time (months)")
+
+
+##Creating the probability density function
+sd=sd(TCGA[,3])
+mean=mean(TCGA[,3])
+sd3=3*sd+mean
+
+abline(h=sd3,col="red",lwd=2) ## line of standard variance
+abline(h=mean,col="blue",lwd=2)## line of mean
+d<-density(as.matrix(TCGA[,3]))## denstity function
+plot(d,xlab="survival time (months)",ylab="density",main = "TCGA") ## plot of density
+curve(dnorm(x,mean,sd),add=T,col="red3",lwd=2) ##"predicted curve"
+
+allp=ncol(TCGA)-3 # number of gene (since the first 3 columns of the original data is not gene)
+
+SS=TCGA[,2]; XX=TCGA[,3] #  SS = os (live or dead)   XX = os.time (how long has the subject alive?),
+
+
+
+APL=c(rep(0,allp)) # creating a empty list for 257 genes
+
+
+## coxph model for every gene
+for (j in 1:allp){ 
+  #print(j)        
+  tempz=(TCGA[,3+j]) ##here is the matrix of gene
+  fit=try(coxph(Surv(XX,SS)~tempz)) ## skip error  because sometime there is no result. N/A
+  
+
+  APL[j]=summary(fit)$coefficients[,5]    ### taking p-value
+}
+APL[which(is.na(APL))]=1 ## set N/A = p-value is 1
+
+
+
+numsel=257# number of genes
+
+## order the result (p-value) from 'coxph' model (from the lowest to highest)
+ssindex=sort(order(APL)[1:numsel]) 
+
+sindex<-ssindex+3 # number of index  in original data (from the third col to start count)
+NTCGA<-cbind(XX,SS,TCGA[,sindex])#time,delta,data (tis is the ordered X matrix)
+
+dim(NTCGA)
+
+tempn<-colnames(NTCGA)
+class(tempn)
+
+NN=dim(NTCGA)[1]
+sum(!duplicated(NTCGA[,1]))==NN ##check the number matched or not
+
+
+
+## include all the subject
+trainindex=sort(sample(sample(sample(c(1:NN))))[1:(round(NN*1))])  ## if we change the index of NN*index, we could chose how my percent subject, we want to use.
+
+
+## test index.........?????? what is this mean?    
+testindex=c(1:NN)[-trainindex]## the orgin code have the testing part. I think we could leave it.
+
+    
+xo<-as.matrix(NTCGA[trainindex,-c(1:2)])##author created this matrix just for train matrix.
+dim(xo)
+  
+    time=NTCGA[trainindex,1]; delta=NTCGA[trainindex,2] ## "1" is for time, '2' is for status.
+    
+    yy<-NTCGA[trainindex,1:2]; colnames(yy)=c("time","status")
+    
+    #cen.r[kkk]=1-mean(delta) ##????? what is this for?
+    
+    n = dim(xo)[1]
+    p = dim(xo)[2]
+    
+PASg=function(z) {
+      g=paste("G", z, sep = "")
+      return(g)
+    }
+    newxo<-cbind(yy,xo) ## yy survial dta and xo is gene matrix
+    
+
+newxo<-as.data.frame(newxo)
+colnames(newxo)<-c("time","event",PASg(c(1:p)))
+
+```
+
+##### marginal partial likelihood screening (mPL)
+
+```{r}
+mPL=numeric(p)
+
+    for(j in 1:p){
+      
+      ###marginal partial likelihood screening
+      fit1 = try(coxph(Surv(time,delta)~xo[,j]))
+      if(inherits(fit1,"try-error")){
+        mPL[j]= -100000
+      } else {
+        mPL[j] = fit1$loglik[2] ###log partial likelihood for jth covariate
+      }
+    }
+
+AZ11=xo[,order(mPL,decreasing=T)[1:numsel]]
+dim(AZ11)
+# PL  Lbeta1
+    fitcv1=ncvsurv(X=AZ11, yy, penalty="MCP", nlambda=100)
+    lam1=fitcv1$lambda[which.min(BIC(fitcv1))] #AIC
+    Lbeta1=as.matrix(coef(fitcv1, lambda=lam1)) 
+    names1=colnames(AZ11)[which(Lbeta1[,1]!=0)]
+    Lbeta1[Lbeta1[,1]!=0,1]
+    
+    summary(fitcv1,lam1)
+    
+rm(AZ11) 
+```
+
+##### SIS
+
+```{r}
+#
+sis <- function(df, time, status, features){
+  out <- apply(df[,features], 2, function(d) abs(cor(d, df[,time])))
+  return(out)
+}
+
+## filled the new X matrix into the SIS model
+NEWSIS<-sis(newxo,"time","event",colnames(newxo)[-c(1:2)])
+
+
+##the number of numsel mean that how many gene will be include in this model
+AZ22=xo[ ,order(NEWSIS,decreasing=T) [1:numsel] ]
+
+##SIS
+ fitcv2=ncvsurv(X=AZ22, yy, penalty="MCP", nlambda=100)
+  lam2=fitcv2$lambda[which.min(BIC(fitcv2))] #AIC
+    Lbeta2=as.matrix(coef(fitcv2, lambda=lam2))
+    names2=colnames(AZ22)[which(Lbeta2[,1]!=0)]
+    Lbeta2[Lbeta2[,1]!=0,1]
+    
+    summary(fitcv2,lam2)
+
+rm(AZ22)  
+```
+
+##### FAST
+
+```{r}
+#FAST function
+FAST <- function(df, time, status, features){
+  uniahaz <- ahaz::ahaz(surv = Surv(df[,time],df[,status]), X = df[,features], univariate = TRUE)
+  out     <- abs(uniahaz$d)
+  return(out)
+}
+
+NEWFAST<-FAST(newxo,"time","event",colnames(newxo)[-c(1:2)])
+
+AZ33=xo[,order(NEWFAST,decreasing=T)[1:numsel]]
+
+ # FAST
+   fitcv3=ncvsurv(X=AZ33, yy, penalty="MCP", nlambda=100)
+    lam3=fitcv3$lambda[which.min(BIC(fitcv3))] #AIC
+   Lbeta3=as.matrix(coef(fitcv3, lambda=lam3))
+   names3=colnames(AZ33)[which(Lbeta3[,1]!=0)]
+   Lbeta3[Lbeta3[,1]!=0,1]
+   
+   
+   summary(fitcv3, lam3)
+    
+rm(AZ33)
+```
+
+##### Method of RCDCS
+
+```{r}
+# Chen, Chen & Wang, CSDA 2018
+RCDCS <- function(df, time, status, features){
+  df     <- df[order(df[,time]),]
+  # Fn(t)
+  kme    <- survfit(formula(paste("Surv(",time,",",status,")~1")), df)
+  df$FnT <- 1 - summary(kme, censored=T, times=df[,time])$surv
+  # replace xj by Fjn(x)
+  df[,features] <- apply(df[,features], 2, function(d) ecdf(d)(d))
+  # distance correlation w/o asymptotic results
+  out <- apply(df[,features], 2, function(d) Rfast::dcor(as.matrix(d), df$FnT)$dcor^2) # ^2(?)
+  return(out)
+}
+
+NEWRCDCS<-RCDCS(newxo,"time","event",colnames(newxo)[-c(1:2)])
+
+
+##the number of numsel mean that how many gene will be include in this model
+AZRCDCS=xo[,order(NEWRCDCS,decreasing=T)[1:numsel]] 
+dim(AZRCDCS)# included all the information of data
+
+     #RCDCS
+    fitcv4=ncvsurv(X=AZRCDCS, yy, penalty="MCP", nlambda=100)
+    lam4=fitcv4$lambda[which.min(BIC(fitcv4))] #AIC
+    Lbeta4=as.matrix(coef(fitcv4, lambda=lam4))
+    names4=colnames(AZRCDCS)[which(Lbeta4[,1]!=0)]
+    
+    Lbeta4[Lbeta4[,1]!=0,1]
+    summary(fitcv4,lam4)
+    
+ 
+
+```
+
+##### CRCDCS
+
+```{r}
+# Chen, Chen & Wang, CSDA 2018
+CRCDCS <- function(df, time, status, features, q=seq(0.1,0.9,0.05)){
+  df     <- df[order(df[,time]),]
+  # Fn(t)
+  kme    <- survfit(formula(paste("Surv(",time,",",status,")~1")), df)
+  df$FnT <- 1 - summary(kme, censored=T, times=df[,time])$surv
+  # Qt(t)
+  qt     <- quantile(kme,q)$quantile # probs apply to F(t)=1-S(t)
+  # nonmissing sample distribution estimates
+  q      <- q[!is.na(qt)]
+  qt     <- qt[!is.na(qt)]
+  # wih
+  wmat <- matrix(NA, ncol=length(q),nrow=nrow(df))
+  for (i in 1:length(q)) {
+    wh       <- ifelse(df[,status]==1 | df$FnT > q[i], 1, (q[i] - df$FnT)/(1 - df$FnT))
+    wmat[,i] <- q[i] - wh * as.numeric(df[,time] <= qt[i])
+  }
+  # replace xj by Fjn(x)
+  df[,features] <- apply(df[,features], 2, function(d) ecdf(d)(d))
+  # distance correlation
+  out <- apply(df[,features], 2, function(d) Rfast::dcor(as.matrix(d), wmat)$dcor^2) # ^2(?)
+  return(out)
+}
+
+
+NEWCRCDCS<-CRCDCS(newxo,"time","event",colnames(newxo)[-c(1:2)])
+
+
+AZ55=xo[,order(NEWCRCDCS,decreasing=T)[1:numsel]]
+
+
+fitcv5=ncvsurv(X=AZ55, yy, penalty="MCP", nlambda=100)
+   lam5=fitcv5$lambda[which.min(BIC(fitcv5))] #AIC
+    Lbeta5=as.matrix(coef(fitcv5, lambda=lam5))
+    names5=colnames(AZ55)[which(Lbeta5[,1]!=0)]
+    Lbeta5[Lbeta5[,1]!=0,1]
+    
+    summary(fitcv5,lam5)
+
+```
+
+##### CINDEX
+
+```{r}
+#
+CoxConc <- function(df, time, status, features){
+  out <- apply(df[,features], 2, function(d) summary(coxph(Surv(df[,time], df[,status]) ~ d))$concordance[1])
+  return(out)
+}
+
+NEWCINDEX<-CoxConc(newxo,"time","event",colnames(newxo)[-c(1:2)])
+
+AZ66=xo[,order(NEWCINDEX,decreasing=T)[1:numsel]]
+
+ fitcv6=ncvsurv(X=AZ66, yy, penalty="MCP", nlambda=100)
+    lam6=fitcv6$lambda[which.min(BIC(fitcv6))] #AIC
+   Lbeta6=as.matrix(coef(fitcv6, lambda=lam6))
+   names6=colnames(AZ66)[which(Lbeta6[,1]!=0)]
+   Lbeta6[Lbeta6[,1]!=0,1]
+    
+   summary(fitcv6,lam6)
+```
+
+##### mIPCW_tau
+
+```{r}
+mIPCW_tau = numeric(p) 
+
+ ##################################################################
+    ###compute Kanplan-Meier estimate for censoring distribution
+    ##################################################################
+    km=survfit(Surv(time,1-delta)~1)
+    kmT=summary(km)$time ; kmS=summary(km)$surv
+    kms=c(rep(0,n))
+    
+    for (i in 1:n){
+      temp=sum(time[i]>=kmT)
+      if (temp==0) kms[i]=1 else kms[i]=kmS[temp]
+    }
+
+     ############################################################
+      #1, > >
+      w=c(delta/kms^2); w[is.infinite(w)]=0; w[is.na(w)]=0
+      v=c(time)
+      W=matrix(c(w),n,n)
+      X=matrix(c(xo[,j]),n,n)
+      V=matrix(c(v),n,n)
+      XX=sign(t(X)-X)
+      VV=sign(t(V)-V)
+      
+      f=n^2-n
+      XX[XX==-1]=0
+      VV[VV==-1]=0
+      A1W=sum(W*XX*VV)/f
+      A1=sum(XX*VV)/f
+      
+      #3, < >
+      XX=sign(t(X)-X)
+      VV=sign(t(V)-V)
+      XX[XX==1]=0; XX[XX==-1]=1
+      VV[VV==-1]=0
+      B1W=sum(W*XX*VV)/f
+      B1=sum(XX*VV)/f
+      
+      ########################################################################
+      mIPCW_tau[j] = abs(2*A1W-2*B1W) #### modified
+
+ 
+      
+      AZ77=xo[,order(mIPCW_tau,decreasing=T)[1:numsel]]
+
+   # IPCW-tau
+    fitcv7=ncvsurv(X=AZ77, yy, penalty="MCP", nlambda=100)
+    
+  
+    
+    lam7=fitcv7$lambda[which.min(BIC(fitcv7))] #AIC
+    
+    Lbeta7=as.matrix(coef(fitcv7, lambda=lam7))
+    
+    names7=colnames(AZ77)[which(Lbeta7[,1]!=0)]
+    Lbeta7[Lbeta7[,1]!=0,1]
+    
+    summary(fitcv7,lam7)
+    
+
+    
+ 
+
+
+
+```
+
+##### IPCW-tau(NPN-MB)
+
+```{r}
+ #################### GLASSO  #####################################
+    #################################################################
+    
+    # step1
+    I=matrix(1,p,1);C=matrix(mIPCW_tau,1,p)
+    tempC=I%*%C
+    tempCsum=apply(tempC,1,sum)
+    CC=tempC/tempCsum
+    
+    ##################################IPCW-tau(NPN-MB)
+    # transform the data using the shrunken ECDF
+    #npn.sxo=huge.npn(x=sxo, npn.func="shrinkage")
+    # transform the non-Gaussian data using the truncated ECDF
+    ##################################################################
+    
+    sxo=scale(xo)
+    npn.sxo=huge.npn(x=sxo, npn.func="truncation")
+    
+    out.npn.mb=huge(x=npn.sxo,nlambda=30,lambda.min.ratio=0.1,method="mb", scr=TRUE)
+    #plot(out.npn.mb)
+    #huge.roc(out.npn.mb$path,L$theta)
+    
+    npn.mb.ric=huge.select(out.npn.mb, criterion="ric")
+    #plot(npn.mb.ric)
+    #print(npn.mb.ric$opt.lambda)
+    
+    wpc2=npn.mb.ric$refit+1-1; diag(wpc2)=1
+    g=network(wpc2)
+    plot(g,main="Estimated NPN-MB network")
+    
+    pcsum2=apply(wpc2,1,sum)
+    A2=wpc2/pcsum2
+    W=seq(0,1,1/100)
+    VV=matrix(0,length(W),p)
+    
+    
+    for (k in 1:length(W)){
+      S=as.matrix((1-W[k])*CC+W[k]*A2)
+      V=matrix(1/p,1,p)
+      for (i in 1:100){
+        V=V%*%S
+        V=V/sum(V)
+      }
+      VV[k,]=V
+    }
+    
+    
+    FV2=apply(VV,2,mean)
+    
+
+
+ AZ88=xo[, order(FV2,decreasing=T)[1:numsel]]
+
+# NPN-MB
+    fitcv8=ncvsurv(X=AZ88, yy, penalty="MCP", nlambda=100)
+    lam8=fitcv8$lambda[which.min(BIC(fitcv8))] #AIC
+    Lbeta8=as.matrix(coef(fitcv8, lambda=lam8))
+    names8=colnames(AZ88)[which(Lbeta8[,1]!=0)]
+    Lbeta8[Lbeta8[,1]!=0,1]
+    
+    summary(fitcv8,lam8)
+    
+
+    
+
+```
+
+## Using SIS to select miRNA \~ survival data
+
+##### Using SIS function
+
+```{r}
+y=Surv(newxo$time,newxo$event)
+dim(y)
+x=newxo[,-c(1:2)]
+x<-as.matrix(x)
+
+sec_model<-tune.fit(x,y,family = 'cox',penalty = 'MCP',tune='bic')
+#sec_model<-SIS(x,y,family = 'cox',penalty = 'MCP',tune='bic')
+
+fitcv0<-sec_model$fit
+lamb0<-fitcv0$lambda
+
+lam0=fitcv0$lambda[which.min(BIC(fitcv0))]#AIC
+summary(fitcv0,lam0)
+
+#colnames(TCGA[188+3])
+#colnames(TCGA[195+3])
+
+```
+
+##### Without using SIS function
+
+```{r}
+sis <- function(df, time, status, features){
+  out <- apply(df[,features], 2, function(d) abs(cor(d, df[,time])))
+  return(out)
+}
+## filled the new X matrix into the SIS model
+NEWSIS<-sis(newxo,"time","event",colnames(newxo)[-c(1:2)])
+##the number of numsel mean that how many gene will be include in this model
+AZ22=xo[ ,order(NEWSIS,decreasing=T) [1:numsel] ]
+##SIS
+ fitcv2=ncvsurv(X=AZ22, yy, penalty="MCP", nlambda=100)
+  lam2=fitcv2$lambda[which.min(BIC(fitcv2))] #AIC
+    Lbeta2=as.matrix(coef(fitcv2, lambda=lam2))
+    names2=colnames(AZ22)[which(Lbeta2[,1]!=0)]
+    Lbeta2[Lbeta2[,1]!=0,1]
+    summary(fitcv2,lam2)
+    
+```
+
+## Looking for miRNA assocation with lymphovascular invasion status?
+
+##### using SIS function to apply lymp data
+
+```{r}
+##import data (which alrady be setted up)
+
+lymp <-read.table("my_data_lymp.txt", header = TRUE)
+
+
+
+##check size
+dim(lymp) ## 326 subjects & 262 variables
+
+
+lymp <- lymp[, c(1:3, 261, 4:260)] ## put variable lymp into 4th col
+
+
+##creat lymp data set
+lymp<-lymp[,-c(2:3)]
+dim(lymp) # 326 subject & 259 variables (the number of gene should be 259-2 = 257)
+
+x<-as.matrix(lymp[-c(1:2)])
+
+y<-lymp$lym_invasion
+
+sis_result <- SIS::SIS(x, y, family = "binomial",penalty = "MCP",tune = "bic")
+
+fitcv3<-sis_result$fit
+lamb3<-fitcv3$lambda
+lam3=fitcv3$lambda[which.min(BIC(fitcv3))]#AIC
+
+summary(fitcv3,lam3)
+
+```
+
+##### using tune.fit function to apply lymp data
+
+```{r}
+
+
+
+sis_result02<-tune.fit(x,y,family = 'binomial',penalty = 'MCP',tune='bic')
+
+fitcv04<-sis_result02$fit
+lamb04<-fitcv04$lambda
+
+lam04=fitcv04$lambda[which.min(BIC(fitcv04))]#AIC
+summary(fitcv04,lam04)
+```
+
+# Using MICE impute survival NA data
+
+### When using MICE there are some limitations
+
+```{r}
+#library("mice")
+
+#summary(df3)
+
+#df3$Surv.2_noNA<-as.factor(df3$Surv.2_noNA)
+
+
+# imputation on mixed data with a different method per column
+#imp <- mice(df3)
+
+
+#test_df_1<-complete(imp,c(5))
+#summary(test_df_1)
+
+```
+
+### merge 5 new imputing missing variable column into data (I add imputed data into df4)
+
+```{r}
+#find1<-complete(imp,c(1))
+#find2<-complete(imp,c(2))
+#find3<-complete(imp,c(3))
+#find4<-complete(imp,c(4))
+#find5<-complete(imp,c(5))
+
+
+#impmiss<-data.frame(find$sampleID,find1$Surv.2_NA,find2$Surv.2_NA,find3$Surv.2_NA,find4$Surv.2_NA,find5$Surv.2_NA)
+
+#summary(impmiss)
+
+
+#df4<-cbind(df3,impmiss)
+
+df4<-read.table("df4.txt", header = TRUE) ##
+
+# Convert selected columns to factors
+df4$clinical_T.x <- as.factor(df4$clinical_T.x)
+df4$clinical_N.x <- as.factor(df4$clinical_N.x)
+df4$clinical_stage.x <- as.factor(df4$clinical_stage.x)
+df4$neoplasm_histologic_grade.x <- as.factor(df4$neoplasm_histologic_grade.x)
+df4$lymphovascular_invasion_present.x <- as.factor(df4$lymphovascular_invasion_present.x)
+df4$gender <- as.factor(df4$gender)
+df4$alcohol_history_documented <- as.factor(df4$alcohol_history_documented)
+df4$margin_status.x <- as.factor(df4$margin_status.x)
+df4$tobacco_smoking_history.x <- as.factor(df4$tobacco_smoking_history.x)
+df4$Surv.2 <- as.factor(df4$Surv.2)
+df4$Surv.2_NA <- as.factor(df4$Surv.2_NA)
+df4$perineural_invasion_present.x <- as.factor(df4$perineural_invasion_present.x)
+
+
+
+df4$find1.Surv.2_NA <- as.factor(df4$find1.Surv.2_NA)
+df4$find2.Surv.2_NA <- as.factor(df4$find2.Surv.2_NA)
+df4$find3.Surv.2_NA <- as.factor(df4$find3.Surv.2_NA)
+df4$find4.Surv.2_NA <- as.factor(df4$find4.Surv.2_NA)
+df4$find5.Surv.2_NA <- as.factor(df4$find5.Surv.2_NA)
+
+## create a new data set for log transformation miRNA data
+df4 <- df4 %>%
+  mutate(log_2_mi264 = log2(1 + MIMAT0000264))
+
+df4 <- df4 %>%
+  mutate(log_2_mi754 = log2(1 + MIMAT0000754))
+
+df4 <- df4 %>%
+  mutate(log_2_mi26472 = log2(1 + MIMAT0026472))
+
+df4 <- df4 %>%
+  mutate(log_2_mi253 = log2(1 + MIMAT0000253))
+
+df4 <- df4 %>%
+  mutate(log_2_mi460 = log2(1 + MIMAT0000460))
+
+df4 <- df4 %>%
+  mutate(log_2_mi97 = log2(1 + MIMAT0000097))
+
+df4 <- df4 %>%
+  mutate(log_2_mi4814 = log2(1 + MIMAT0004814))
+
+df4 <- df4 %>%
+  mutate(log_2_mi87 = log2(1 + MIMAT0000087))
+
+df4$Surv.2_noNA<-as.factor(df4$Surv.2_noNA)
+
+summary(df4)
+```
